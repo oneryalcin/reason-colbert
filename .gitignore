@@ -13,3 +13,7 @@ wheels/
 model/
 model_onnx/
 model_onnx_int8/
+
+# KD pipeline data (generated, large)
+kd_data/
+output/
