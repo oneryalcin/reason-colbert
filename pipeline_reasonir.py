@@ -65,15 +65,26 @@ def step1_load_patients():
 
 
 def step2_build_bm25(uid_to_text):
-    """Build BM25 index over all patients."""
-    from rank_bm25 import BM25Okapi
+    """Build BM25 index over all patients using Tantivy (Rust)."""
+    import tantivy
 
-    print("Building BM25 index...")
+    print("Building Tantivy BM25 index...")
     uids = list(uid_to_text.keys())
-    tokenized = [uid_to_text[uid].lower().split() for uid in uids]
-    bm25 = BM25Okapi(tokenized)
+
+    schema_builder = tantivy.SchemaBuilder()
+    schema_builder.add_text_field("uid", stored=True)
+    schema_builder.add_text_field("body", stored=False, tokenizer_name="en_stem")
+    schema = schema_builder.build()
+
+    index = tantivy.Index(schema)
+    writer = index.writer(heap_size=256_000_000)
+    for uid in uids:
+        writer.add_document(tantivy.Document(uid=uid, body=uid_to_text[uid]))
+    writer.commit()
+    index.reload()
+
     print(f"  Indexed {len(uids)} documents")
-    return bm25, uids
+    return index, uids
 
 
 def step3_sample_documents(uid_to_text):
@@ -186,20 +197,20 @@ def step4_generate_queries(uid_to_text, selected_uids):
     print(f"Query generation complete. {total_done} succeeded, {total_errors} errors. Cost: ${total_cost:.4f}")
 
 
-def step5_mine_hard_negatives(uid_to_text, bm25, uids):
-    """BM25 hard negative mining (rank 20+ to avoid false negatives)."""
+def step5_mine_hard_negatives(uid_to_text, index, uids):
+    """BM25 hard negative mining via Tantivy (rank 20+ to avoid false negatives)."""
     queries_path = OUTPUT_DIR / "generated_queries.jsonl"
     training_path = OUTPUT_DIR / "training_data.jsonl"
 
-    # Load generated queries
     generated = []
     with open(queries_path) as f:
         for line in f:
             generated.append(json.loads(line))
 
-    print(f"Mining hard negatives for {len(generated)} examples...")
-    uid_set = set(uids)
-    uid_to_idx = {uid: i for i, uid in enumerate(uids)}
+    print(f"Mining hard negatives for {len(generated)} examples (Tantivy)...")
+    searcher = index.searcher()
+    # Fetch enough results to skip top-20 + same-PMID filtering
+    fetch_limit = HARD_NEG_START_RANK + N_HARD_NEGS + 50
 
     training_data = []
     for i, entry in enumerate(generated):
@@ -207,16 +218,15 @@ def step5_mine_hard_negatives(uid_to_text, bm25, uids):
         doc_text = entry["document"]
         doc_pmid = doc_uid.split("-")[0]
 
-        for query in entry["queries"]:
-            query_tokens = query.lower().split()
-            scores = bm25.get_scores(query_tokens)
-            top_indices = scores.argsort()[::-1]
+        for query_text in entry["queries"]:
+            query = index.parse_query(query_text, ["body"])
+            results = searcher.search(query, limit=fetch_limit)
 
-            # Hard negatives: rank 20+, skip same PMID
             hard_negs = []
             rank = 0
-            for idx in top_indices:
-                neg_uid = uids[idx]
+            for score, addr in results.hits:
+                doc = searcher.doc(addr)
+                neg_uid = doc["uid"][0]
                 neg_pmid = neg_uid.split("-")[0]
                 if neg_uid == doc_uid or neg_pmid == doc_pmid:
                     continue
@@ -227,7 +237,7 @@ def step5_mine_hard_negatives(uid_to_text, bm25, uids):
                         break
 
             training_data.append({
-                "query": query,
+                "query": query_text,
                 "pos": [doc_text],
                 "neg": hard_negs,
             })
@@ -332,10 +342,10 @@ if __name__ == "__main__":
 
     if step == "all":
         uid_to_text = step1_load_patients()
-        bm25, uids = step2_build_bm25(uid_to_text)
+        index, uids = step2_build_bm25(uid_to_text)
         selected = step3_sample_documents(uid_to_text)
         step4_generate_queries(uid_to_text, selected)
-        training_data = step5_mine_hard_negatives(uid_to_text, bm25, uids)
+        training_data = step5_mine_hard_negatives(uid_to_text, index, uids)
         step6_format_for_pylate(training_data)
     elif step == "generate":
         uid_to_text = step1_load_patients()
@@ -343,8 +353,8 @@ if __name__ == "__main__":
         step4_generate_queries(uid_to_text, selected)
     elif step == "mine":
         uid_to_text = step1_load_patients()
-        bm25, uids = step2_build_bm25(uid_to_text)
-        training_data = step5_mine_hard_negatives(uid_to_text, bm25, uids)
+        index, uids = step2_build_bm25(uid_to_text)
+        training_data = step5_mine_hard_negatives(uid_to_text, index, uids)
         step6_format_for_pylate(training_data)
     elif step == "train":
         step7_train()

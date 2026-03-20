@@ -13,5 +13,6 @@ dependencies = [
     "pylate>=1.4.0",
     "pytest>=9.0.2",
     "rank-bm25>=0.2.2",
+    "tantivy>=0.25.1",
     "tiktoken>=0.12.0",
 ]
