@@ -22,7 +22,8 @@ from pathlib import Path
 N_TRAIN_QUERIES = 2000       # queries to generate KD data for
 N_CANDIDATES = 20            # BM25 candidates per query
 OUTPUT_DIR = Path("kd_data")
-ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+LLM_MODEL = "minimax/minimax-m2.7"
+LLM_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def step1_load_patients():
@@ -103,10 +104,14 @@ def step3_generate_candidates(uid_to_text, bm25, uids):
 
 
 def step4_llm_score(candidates):
-    """Use Claude to score clinical similarity for each query-candidate pair."""
-    import anthropic
+    """Use LLM via OpenRouter to score clinical similarity."""
+    import re
+    from openai import OpenAI
 
-    client = anthropic.Anthropic()
+    client = OpenAI(
+        base_url=LLM_BASE_URL,
+        api_key=os.environ["OPENROUTER_API_KEY"],
+    )
     OUTPUT_DIR.mkdir(exist_ok=True)
     scored_path = OUTPUT_DIR / "scored_candidates.jsonl"
 
@@ -134,11 +139,12 @@ Score guide:
 - 0.1-0.3: Minimal clinical relevance
 - 0.0: Completely unrelated
 
-Respond with ONLY a JSON array, one object per candidate in order:
+End your response with a JSON array, one object per candidate in order:
 [{"score": <float>, "reason": "<one sentence>"}]"""
 
     remaining = [c for c in candidates if c["query_uid"] not in done_queries]
-    print(f"Scoring {len(remaining)} queries with {ANTHROPIC_MODEL}...")
+    print(f"Scoring {len(remaining)} queries with {LLM_MODEL}...")
+    total_cost = 0.0
 
     with open(scored_path, "a") as f:
         for i, entry in enumerate(remaining):
@@ -150,18 +156,39 @@ Respond with ONLY a JSON array, one object per candidate in order:
             user_msg = f"[Query Patient]: {entry['query_text'][:800]}\n\n{candidate_block}"
 
             try:
-                resp = client.messages.create(
-                    model=ANTHROPIC_MODEL,
+                resp = client.chat.completions.create(
+                    model=LLM_MODEL,
                     max_tokens=2000,
-                    system=system_prompt,
-                    messages=[{"role": "user", "content": user_msg}],
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_msg},
+                    ],
                 )
-                text = resp.content[0].text.strip()
-                if text.startswith("```"):
-                    text = text.split("```")[1].strip()
-                    if text.startswith("json"):
-                        text = text[4:].strip()
-                scores = json.loads(text)
+
+                # Handle reasoning models (content in model_extra.reasoning)
+                msg = resp.choices[0].message
+                text = msg.content
+                if not text and hasattr(msg, "model_extra"):
+                    text = msg.model_extra.get("reasoning", "")
+
+                if not text:
+                    print(f"  Empty response for {entry['query_uid']}")
+                    continue
+
+                # Extract last valid JSON array from response
+                scores = None
+                for match in reversed(re.findall(r"\[[\s\S]*?\]", text)):
+                    try:
+                        parsed = json.loads(match)
+                        if parsed and isinstance(parsed[0], dict) and "score" in parsed[0]:
+                            scores = parsed
+                            break
+                    except (json.JSONDecodeError, IndexError):
+                        continue
+
+                if not scores:
+                    print(f"  No JSON found for {entry['query_uid']}")
+                    continue
 
                 scored = []
                 for j, cand in enumerate(entry["candidates"]):
@@ -180,14 +207,17 @@ Respond with ONLY a JSON array, one object per candidate in order:
                 f.write(json.dumps(result) + "\n")
                 f.flush()
 
+                cost = getattr(resp.usage, "cost", 0) or 0
+                total_cost += cost
+
             except Exception as e:
                 print(f"  Error on query {entry['query_uid']}: {e}")
                 continue
 
             if (i + 1) % 50 == 0:
-                print(f"  {i+1}/{len(remaining)} queries scored")
+                print(f"  {i+1}/{len(remaining)} scored (${total_cost:.4f} so far)")
 
-    print(f"Scoring complete. Saved to {scored_path}")
+    print(f"Scoring complete. Total cost: ${total_cost:.4f}. Saved to {scored_path}")
 
 
 def step5_format_for_pylate():
