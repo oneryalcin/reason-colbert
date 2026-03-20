@@ -97,10 +97,13 @@ def step3_sample_documents(uid_to_text):
 
 
 def step4_generate_queries(uid_to_text, selected_uids):
-    """LLM generates reasoning-intensive queries from patient cases."""
-    from openai import OpenAI
+    """LLM generates reasoning-intensive queries from patient cases (parallel)."""
+    import asyncio
+    from openai import AsyncOpenAI
 
-    client = OpenAI(
+    CONCURRENCY = 50  # parallel requests
+
+    client = AsyncOpenAI(
         base_url=LLM_BASE_URL,
         api_key=os.environ["OPENROUTER_API_KEY"],
     )
@@ -116,18 +119,22 @@ def step4_generate_queries(uid_to_text, selected_uids):
         print(f"Resuming: {len(done_uids)} already generated")
 
     remaining = [uid for uid in selected_uids if uid not in done_uids]
-    print(f"Generating queries for {len(remaining)} patients with {LLM_MODEL}...")
-    total_cost = 0.0
+    print(f"Generating queries for {len(remaining)} patients with {LLM_MODEL} (concurrency={CONCURRENCY})...")
 
     sys_prompt = SYSTEM_PROMPT.format(n=QUERIES_PER_DOC)
+    total_cost = 0.0
+    total_done = 0
+    total_errors = 0
+    lock = asyncio.Lock()
 
-    with open(queries_path, "a") as f:
-        for i, uid in enumerate(remaining):
+    async def process_one(uid, sem, f):
+        nonlocal total_cost, total_done, total_errors
+        async with sem:
             text = uid_to_text[uid]
             user_msg = USER_PROMPT.format(patient_text=text[:1500])
 
             try:
-                resp = client.chat.completions.create(
+                resp = await client.chat.completions.create(
                     model=LLM_MODEL,
                     max_tokens=300,
                     messages=[
@@ -137,37 +144,46 @@ def step4_generate_queries(uid_to_text, selected_uids):
                 )
 
                 content = resp.choices[0].message.content or ""
-                # Extract JSON
                 match = re.search(r"\{[\s\S]*\}", content)
                 if not match:
-                    print(f"  No JSON for {uid}")
-                    continue
+                    total_errors += 1
+                    return
 
                 parsed = json.loads(match.group())
                 queries = parsed.get("queries", [])
                 if not queries:
-                    print(f"  Empty queries for {uid}")
-                    continue
+                    total_errors += 1
+                    return
 
                 result = {
                     "uid": uid,
                     "document": text[:2000],
                     "queries": queries[:QUERIES_PER_DOC],
                 }
-                f.write(json.dumps(result) + "\n")
-                f.flush()
-
-                cost = getattr(resp.usage, "cost", 0) or 0
-                total_cost += cost
+                async with lock:
+                    f.write(json.dumps(result) + "\n")
+                    f.flush()
+                    cost = getattr(resp.usage, "cost", 0) or 0
+                    total_cost += cost
+                    total_done += 1
+                    if total_done % 100 == 0:
+                        print(f"  {total_done}/{len(remaining)} done, {total_errors} errors (${total_cost:.4f})")
 
             except Exception as e:
-                print(f"  Error on {uid}: {e}")
-                continue
+                total_errors += 1
+                if total_errors % 20 == 0:
+                    print(f"  {total_errors} errors so far, latest: {e}")
 
-            if (i + 1) % 100 == 0:
-                print(f"  {i+1}/{len(remaining)} done (${total_cost:.4f})")
+    async def run_all():
+        sem = asyncio.Semaphore(CONCURRENCY)
+        # Use sync file handle (writes are small and serialized by lock)
+        f = open(queries_path, "a")
+        tasks = [process_one(uid, sem, f) for uid in remaining]
+        await asyncio.gather(*tasks)
+        f.close()
 
-    print(f"Query generation complete. Cost: ${total_cost:.4f}")
+    asyncio.run(run_all())
+    print(f"Query generation complete. {total_done} succeeded, {total_errors} errors. Cost: ${total_cost:.4f}")
 
 
 def step5_mine_hard_negatives(uid_to_text, bm25, uids):
